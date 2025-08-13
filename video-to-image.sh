@@ -5,13 +5,14 @@ shopt -s nullglob
 usage() {
   cat <<'EOF'
 Uso:
-  video_to_frames.sh --out <DIR> [opções] -- <video1> [video2 ...]
+  video-to-image.sh --out <DIR> [opções] -- <video1> [video2 ...]
 Exemplos:
-  video_to_frames.sh --out ./frames -- -- input.mp4
-  video_to_frames.sh --out ./frames --fps 5 --scale 1280:-1 --unique -- -- a.mp4 b.mov
-  video_to_frames.sh --out ./frames --webp --dedupe phash:6 -- -- input.mp4
-  video_to_frames.sh --out ./frames --flat -- -- a.mp4 b.mp4
-  video_to_frames.sh --out ./frames --no-opt --debug -- -- clip.mp4
+  video-to-image.sh --out ./frames -- -- input.mp4
+  video-to-image.sh --out ./frames --fps 5 --scale 1280:-1 --unique -- -- a.mp4 b.mov
+  video-to-image.sh --out ./frames --webp --dedupe phash:6 -- -- input.mp4
+  video-to-image.sh --out ./frames --flat -- -- a.mp4 b.mp4
+  video-to-image.sh --out ./frames --scene 0.05~0.10 --scene-step 0.01 -- -- clip.mp4
+  video-to-image.sh --out ./frames --no-opt --debug -- -- clip.mp4
 
 Opções:
   --fps N            Limita a N fps (após dedupe, se habilitado)
@@ -19,10 +20,12 @@ Opções:
   --start TIME       Começa em TIME (ex.: 00:00:05)
   --duration D       Duração (ex.: 10 ou 00:00:10)
   --unique           Remove frames quase idênticos na extração (mpdecimate)
-  --scene T          Mantém só mudanças de cena (select='gt(scene,T)') ex.: 0.08
+  --scene T|A~B      Mantém só mudanças de cena. Aceita um valor (ex.: 0.08)
+                     ou faixa A~B (ex.: 0.05~0.10) — tenta de B para A.
+  --scene-step S     Passo quando usar faixa em --scene (padrão: 0.01)
   --dedupe MODE      Pós-processo: "exact" | "phash[:N]" (N padrão 5)
   --webp             Salva em WebP lossless (menor que PNG). Requer 'webp'
-  --flat             NÃO cria subpasta por vídeo (tudo em <DIR>, c/ prefixo automático por vídeo)
+  --flat             NÃO cria subpasta por vídeo (tudo em <DIR>, c/ prefixo auto por vídeo)
   --prefix P         Prefixo manual (senão é gerado do nome do vídeo em --flat)
   --no-opt           Pula otimização de PNGs com oxipng (mais rápido)
   --debug            Mostra comandos e logs mais verbosos do ffmpeg
@@ -30,8 +33,7 @@ Opções:
 
 Notas:
 - Sem --flat: saída por vídeo vai para <DIR>/<basename>/frame_000001.ext
-- Em --flat, se você não passar --prefix, o script usa o basename do vídeo,
-  adicionando -2/-3 se necessário para evitar colisão.
+- Em --flat, se não passar --prefix, usamos basename do vídeo (com -2/-3 se preciso).
 - Fallbacks automáticos se nenhum frame for gerado.
 EOF
 }
@@ -39,7 +41,7 @@ EOF
 # ---------- parse ----------
 OUTDIR=""
 FPS=""; SCALE=""; SS=""; DUR=""
-UNIQUE="0"; SCENE=""; DEDUPE=""
+UNIQUE="0"; SCENE=""; SCENE_STEP="0.01"; DEDUPE=""
 USE_WEBP="0"
 FLAT="0"; PREFIX=""
 NO_OPT="0"; DEBUG="0"
@@ -56,6 +58,7 @@ while [[ $# -gt 0 ]]; do
     --duration) DUR="${2:-}"; shift 2;;
     --unique)   UNIQUE="1"; shift;;
     --scene)    SCENE="${2:-}"; shift 2;;
+    --scene-step) SCENE_STEP="${2:-}"; shift 2;;
     --dedupe)   DEDUPE="${2:-}"; shift 2;;
     --webp)     USE_WEBP="1"; shift;;
     --flat)     FLAT="1"; shift;;
@@ -100,7 +103,7 @@ make_unique_dir() {
   echo "$dir"
 }
 
-# corrigido: evita loop infinito com ls; usa compgen -G
+# evita loop: usa compgen -G para checar padrão
 make_auto_prefix_for_flat() {
   local name="$1" out="$2"
   local base="${name//[^a-zA-Z0-9._-]/_}"
@@ -112,10 +115,12 @@ make_auto_prefix_for_flat() {
   echo "${try}_"
 }
 
-build_vf() {
+# monta -vf dado um scene_threshold opcional (vazio = sem select)
+build_vf_with_scene() {
+  local scene_t="${1:-}"  # "" ou "0.08"
   local vf_parts=()
-  if [[ -n "$SCENE" ]]; then
-    vf_parts+=("select='gt(scene,${SCENE})'")
+  if [[ -n "$scene_t" ]]; then
+    vf_parts+=("select='gt(scene,${scene_t})'")
   elif [[ "$UNIQUE" == "1" ]]; then
     vf_parts+=("mpdecimate=hi=768:lo=128:frac=0.33")
   fi
@@ -192,7 +197,6 @@ run_ffmpeg_once() {
   local outpat="$outdir/${prefix}%06d.${ext}"
 
   local cmd=(ffmpeg -hide_banner -loglevel "$loglevel" -stats -y)
-  # aceleração por hardware (melhora velocidade em M1)
   cmd+=(-hwaccel videotoolbox)
   [[ -n "$ss"  ]] && cmd+=(-ss "$ss")
   cmd+=(-i "$input")
@@ -207,6 +211,29 @@ run_ffmpeg_once() {
 
   echo "   CMD: ${cmd[*]}"
   "${cmd[@]}" || true
+}
+
+# gera sequência de thresholds (B..A descendo) quando SCENE é A~B
+scene_candidates_desc() {
+  local range="$1" step="$2"
+  /usr/bin/env python3 - "$range" "$step" <<'PY'
+import sys
+lo,hi = sys.argv[1].split('~')
+lo=float(lo); hi=float(hi); step=float(sys.argv[2])
+# garante direção decrescente hi -> lo
+if hi < lo: lo,hi = hi,lo
+vals=[]
+x=hi
+# evita erros de ponto flutuante
+from decimal import Decimal, getcontext
+getcontext().prec=6
+dlo=Decimal(str(lo)); dhi=Decimal(str(hi)); dstep=Decimal(str(step))
+x=dhi
+while x >= dlo - Decimal("1e-9"):
+    vals.append(str(float(x)))
+    x = x - dstep
+print(" ".join(vals))
+PY
 }
 
 # ---------- processamento ----------
@@ -227,22 +254,37 @@ for INPUT in "${INPUTS[@]}"; do
 
   ext="png"; [[ "$USE_WEBP" == "1" ]] && ext="webp"
   prefix="${PREFIX}frame_"
-  vf_primary="$(build_vf)"
 
   echo ">> Processando: $INPUT"
   echo "   Saída: $outdir_video (formato: $ext)"
-  [[ -n "$vf_primary" ]] && echo "   -vf primário: \"$vf_primary\""
   [[ -n "$SS"  ]] && echo "   -ss $SS"
   [[ -n "$DUR" ]] && echo "   -t  $DUR"
   [[ "$FLAT" == "1" ]] && echo "   Prefixo: ${PREFIX}"
 
-  # 1) Rodada principal (com filtros escolhidos)
-  run_ffmpeg_once "$INPUT" "$outdir_video" "$prefix" "$vf_primary" "$ext" "$SS" "$DUR"
-  c1=$(count_frames "$outdir_video" "$prefix" "$ext")
+  frames_count=0
 
-  if (( c1 == 0 )) && { [[ "$UNIQUE" == "1" ]] || [[ -n "$SCENE" ]]; }; then
-    echo "   [fallback] 0 frames com dedupe/scene; tentando sem dedupe/scene..."
-    # 2) Sem dedupe/scene, mantendo fps/scale do usuário
+  # 1) Se --scene for faixa A~B, tentar B..A (desc) com passo
+  if [[ -n "$SCENE" && "$SCENE" == *~* ]]; then
+    echo "   Tentando thresholds de cena (desc): $SCENE passo $SCENE_STEP"
+    read -r -a SCENE_LIST <<<"$(scene_candidates_desc "$SCENE" "$SCENE_STEP")"
+    for scene_t in "${SCENE_LIST[@]}"; do
+      vf_try="$(build_vf_with_scene "$scene_t")"
+      echo "   -vf scene=${scene_t}"
+      run_ffmpeg_once "$INPUT" "$outdir_video" "$prefix" "$vf_try" "$ext" "$SS" "$DUR"
+      frames_count=$(count_frames "$outdir_video" "$prefix" "$ext")
+      (( frames_count > 0 )) && break
+    done
+  else
+    # 1a) --scene simples OU --unique/normal
+    vf_primary="$(build_vf_with_scene "${SCENE}")"
+    [[ -n "$vf_primary" ]] && echo "   -vf primário: \"$vf_primary\""
+    run_ffmpeg_once "$INPUT" "$outdir_video" "$prefix" "$vf_primary" "$ext" "$SS" "$DUR"
+    frames_count=$(count_frames "$outdir_video" "$prefix" "$ext")
+  fi
+
+  # 2) Fallback sem dedupe/scene (mantém fps/scale)
+  if (( frames_count == 0 )); then
+    echo "   [fallback] 0 frames; tentando sem dedupe/scene..."
     vf_no_ded=""
     [[ -n "$FPS"   ]] && vf_no_ded+="fps=${FPS}"
     if [[ -n "$SCALE" ]]; then
@@ -250,22 +292,23 @@ for INPUT in "${INPUTS[@]}"; do
       vf_no_ded+="scale=${SCALE}:flags=lanczos"
     fi
     run_ffmpeg_once "$INPUT" "$outdir_video" "$prefix" "$vf_no_ded" "$ext" "$SS" "$DUR"
-    c1=$(count_frames "$outdir_video" "$prefix" "$ext")
+    frames_count=$(count_frames "$outdir_video" "$prefix" "$ext")
   fi
 
-  if (( c1 == 0 )); then
-    echo "   [fallback] Ainda 0; tentando mínimo (fps=1, scale=-1:720)..."
+  # 3) Fallback mínimo
+  if (( frames_count == 0 )); then
+    echo "   [fallback] Ainda 0; fps=1, scale=-1:720..."
     vf_min="fps=1,scale=-1:720:flags=lanczos"
     run_ffmpeg_once "$INPUT" "$outdir_video" "$prefix" "$vf_min" "$ext" "$SS" "$DUR"
-    c1=$(count_frames "$outdir_video" "$prefix" "$ext")
+    frames_count=$(count_frames "$outdir_video" "$prefix" "$ext")
   fi
 
-  if (( c1 == 0 )); then
-    echo "   Falhou: 0 frames gerados. Rode com --debug ou FFMPEG_LOGLEVEL=info para diagnosticar."
+  if (( frames_count == 0 )); then
+    echo "   Falhou: 0 frames gerados. Use --debug ou FFMPEG_LOGLEVEL=info para diagnosticar."
     continue
   fi
 
-  echo "   Frames gerados: $c1"
+  echo "   Frames gerados: $frames_count"
 
   # Otimização PNG (opcional)
   if [[ "$ext" == "png" && "$NO_OPT" != "1" ]]; then
