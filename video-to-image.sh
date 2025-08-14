@@ -5,36 +5,35 @@ shopt -s nullglob
 usage() {
   cat <<'EOF'
 Uso:
-  video-to-image.sh --out <DIR> [opções] -- <video1> [video2 ...]
+  video_to_frames.sh --out <DIR> [opções] -- <video1> [video2 ...]
 Exemplos:
-  video-to-image.sh --out ./frames -- -- input.mp4
-  video-to-image.sh --out ./frames --fps 5 --scale 1280:-1 --unique -- -- a.mp4 b.mov
-  video-to-image.sh --out ./frames --webp --dedupe phash:6 -- -- input.mp4
-  video-to-image.sh --out ./frames --flat -- -- a.mp4 b.mp4
-  video-to-image.sh --out ./frames --scene 0.05~0.10 --scene-step 0.01 -- -- clip.mp4
-  video-to-image.sh --out ./frames --no-opt --debug -- -- clip.mp4
+  video_to_frames.sh --out ./frames -- -- input.mp4
+  video_to_frames.sh --out ./frames --fps 5 --scale 1280:-1 --unique -- -- a.mp4 b.mov
+  video_to_frames.sh --out ./frames --webp --dedupe phash:6 -- -- input.mp4
+  video_to_frames.sh --out ./frames --flat -- -- a.mp4 b.mp4
+  video_to_frames.sh --out ./frames --scene 0.05~0.10 --scene-step 0.01 -- -- clip.mp4
+  video_to_frames.sh --out ./frames --no-opt --debug -- -- clip.mp4
 
 Opções:
   --fps N            Limita a N fps (após dedupe, se habilitado)
   --scale WxH        Redimensiona (ex.: 1280:-1 ou -1:720), lanczos
   --start TIME       Começa em TIME (ex.: 00:00:05)
   --duration D       Duração (ex.: 10 ou 00:00:10)
-  --unique           Remove frames quase idênticos na extração (mpdecimate)
-  --scene T|A~B      Mantém só mudanças de cena. Aceita um valor (ex.: 0.08)
-                     ou faixa A~B (ex.: 0.05~0.10) — tenta de B para A.
+  --unique           Remove quase idênticos na extração (mpdecimate)
+  --scene T|A~B      Só mudanças de cena; aceita faixa A~B (tenta de B→A)
   --scene-step S     Passo quando usar faixa em --scene (padrão: 0.01)
-  --dedupe MODE      Pós-processo: "exact" | "phash[:N]" (N padrão 5)
-  --webp             Salva em WebP lossless (menor que PNG). Requer 'webp'
-  --flat             NÃO cria subpasta por vídeo (tudo em <DIR>, c/ prefixo auto por vídeo)
-  --prefix P         Prefixo manual (senão é gerado do nome do vídeo em --flat)
-  --no-opt           Pula otimização de PNGs com oxipng (mais rápido)
-  --debug            Mostra comandos e logs mais verbosos do ffmpeg
+  --dedupe MODE      Pós: "exact" | "phash[:N]" (N padrão 5)
+  --webp             Salva em WebP lossless (menor que PNG)
+  --flat             NÃO cria subpasta; usa prefixo automático por vídeo
+  --prefix P         Prefixo manual (senão é gerado no --flat)
+  --no-opt           Pula otimização de PNGs (mais rápido)
+  --debug            Mostra comandos e logs do ffmpeg
   -h, --help         Ajuda
 
 Notas:
-- Sem --flat: saída por vídeo vai para <DIR>/<basename>/frame_000001.ext
-- Em --flat, se não passar --prefix, usamos basename do vídeo (com -2/-3 se preciso).
-- Fallbacks automáticos se nenhum frame for gerado.
+- Sem --flat: saída em <DIR>/<basename>/frame_000001.ext
+- Em --flat, prefixo automático baseado no nome do vídeo (com -2/-3 se preciso)
+- Fallbacks automáticos se nenhum frame for gerado
 EOF
 }
 
@@ -81,7 +80,7 @@ fi
 mkdir -p "$OUTDIR"
 [[ "$DEBUG" == "1" ]] && set -x
 
-# ---------- Homebrew & deps ----------
+# ---------- Homebrew & ffmpeg/oxipng ----------
 if ! command -v brew >/dev/null 2>&1; then
   echo "Instalando Homebrew..."
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
@@ -115,9 +114,25 @@ make_auto_prefix_for_flat() {
   echo "${try}_"
 }
 
+# venv dedicado para o pHash (foge do PEP 668)
+PHASH_VENV="${HOME}/.cache/video_to_frames/venv"
+ensure_phash_env() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Instalando Python 3 via Homebrew..."
+    brew install python || true
+  fi
+  if [[ ! -x "$PHASH_VENV/bin/python" ]]; then
+    echo "Criando venv para pHash em: $PHASH_VENV"
+    mkdir -p "$(dirname "$PHASH_VENV")"
+    python3 -m venv "$PHASH_VENV"
+    "$PHASH_VENV/bin/pip" --disable-pip-version-check -q install --upgrade pip wheel setuptools
+    "$PHASH_VENV/bin/pip" --disable-pip-version-check -q install pillow imagehash
+  fi
+}
+
 # monta -vf dado um scene_threshold opcional (vazio = sem select)
 build_vf_with_scene() {
-  local scene_t="${1:-}"  # "" ou "0.08"
+  local scene_t="${1:-}"
   local vf_parts=()
   if [[ -n "$scene_t" ]]; then
     vf_parts+=("select='gt(scene,${scene_t})'")
@@ -134,11 +149,12 @@ count_frames() {
   ls -1 "$dir"/${prefix}*.${ext} 2>/dev/null | wc -l | tr -d ' '
 }
 
+# otimização rápida por padrão (evita travas)
 optimize_pngs_parallel() {
   local dir="$1" prefix="$2"
   local cores; cores="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
   find "$dir" -type f -name "${prefix}*.png" -print0 \
-    | xargs -0 -n1 -P "$cores" oxipng -o max --strip all --zopfli --quiet || true
+    | xargs -0 -n1 -P "$cores" oxipng -o 3 --strip safe --quiet || true
 }
 
 dedupe_exact() {
@@ -153,47 +169,51 @@ dedupe_exact() {
   }' "$tmp"
 }
 
+# usa o venv dedicado (Pillow + imagehash)
 dedupe_phash() {
   local dir="$1"; local thresh="${2:-5}"
-  /usr/bin/env python3 - "$dir" "$thresh" <<'PY'
+  ensure_phash_env
+  "$PHASH_VENV/bin/python" - "$dir" "$thresh" <<'PY'
 import sys, os, glob
 from PIL import Image
-try:
-    import imagehash
-except ImportError:
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "pillow", "imagehash"])
-    import imagehash
+import imagehash
+
 folder = sys.argv[1]
 threshold = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+
 files = sorted(glob.glob(os.path.join(folder, "*.png")) + glob.glob(os.path.join(folder, "*.webp")))
-seen=[]
-def h(path):
+seen = []
+
+def get_hash(path):
     try:
         with Image.open(path) as im:
             im = im.convert("RGB")
             return imagehash.phash(im)
     except Exception:
         return None
+
 for f in files:
-    hf = h(f)
-    if hf is None: continue
-    dup=False
-    for (g,hg) in seen:
+    hf = get_hash(f)
+    if hf is None:
+        continue
+    dup = False
+    for (g, hg) in seen:
         if hf - hg <= threshold:
             print(f"removendo quase-duplicado (dist={hf-hg}): {f} ~ {g}")
-            try: os.remove(f)
-            except FileNotFoundError: pass
-            dup=True
+            try:
+                os.remove(f)
+            except FileNotFoundError:
+                pass
+            dup = True
             break
     if not dup:
-        seen.append((f,hf))
+        seen.append((f, hf))
 PY
 }
 
 run_ffmpeg_once() {
   local input="$1" outdir="$2" prefix="$3" vf="$4" ext="$5" ss="$6" dur="$7"
-  local loglevel="${FFMPEG_LOGLEVEL:-error}"  # export FFMPEG_LOGLEVEL=info se quiser
+  local loglevel="${FFMPEG_LOGLEVEL:-error}"
   local outpat="$outdir/${prefix}%06d.${ext}"
 
   local cmd=(ffmpeg -hide_banner -loglevel "$loglevel" -stats -y)
@@ -213,18 +233,16 @@ run_ffmpeg_once() {
   "${cmd[@]}" || true
 }
 
-# gera sequência de thresholds (B..A descendo) quando SCENE é A~B
+# thresholds B..A (desc) quando --scene=A~B
 scene_candidates_desc() {
   local range="$1" step="$2"
   /usr/bin/env python3 - "$range" "$step" <<'PY'
 import sys
 lo,hi = sys.argv[1].split('~')
 lo=float(lo); hi=float(hi); step=float(sys.argv[2])
-# garante direção decrescente hi -> lo
 if hi < lo: lo,hi = hi,lo
 vals=[]
 x=hi
-# evita erros de ponto flutuante
 from decimal import Decimal, getcontext
 getcontext().prec=6
 dlo=Decimal(str(lo)); dhi=Decimal(str(hi)); dstep=Decimal(str(step))
@@ -263,7 +281,7 @@ for INPUT in "${INPUTS[@]}"; do
 
   frames_count=0
 
-  # 1) Se --scene for faixa A~B, tentar B..A (desc) com passo
+  # 1) --scene faixa: tenta de B→A
   if [[ -n "$SCENE" && "$SCENE" == *~* ]]; then
     echo "   Tentando thresholds de cena (desc): $SCENE passo $SCENE_STEP"
     read -r -a SCENE_LIST <<<"$(scene_candidates_desc "$SCENE" "$SCENE_STEP")"
@@ -275,14 +293,13 @@ for INPUT in "${INPUTS[@]}"; do
       (( frames_count > 0 )) && break
     done
   else
-    # 1a) --scene simples OU --unique/normal
     vf_primary="$(build_vf_with_scene "${SCENE}")"
     [[ -n "$vf_primary" ]] && echo "   -vf primário: \"$vf_primary\""
     run_ffmpeg_once "$INPUT" "$outdir_video" "$prefix" "$vf_primary" "$ext" "$SS" "$DUR"
     frames_count=$(count_frames "$outdir_video" "$prefix" "$ext")
   fi
 
-  # 2) Fallback sem dedupe/scene (mantém fps/scale)
+  # 2) Fallback sem dedupe/scene
   if (( frames_count == 0 )); then
     echo "   [fallback] 0 frames; tentando sem dedupe/scene..."
     vf_no_ded=""
@@ -310,13 +327,13 @@ for INPUT in "${INPUTS[@]}"; do
 
   echo "   Frames gerados: $frames_count"
 
-  # Otimização PNG (opcional)
+  # Otimização PNG (rápida) — pule com --no-opt
   if [[ "$ext" == "png" && "$NO_OPT" != "1" ]]; then
     echo "   Otimizando PNGs em paralelo..."
     optimize_pngs_parallel "$outdir_video" "$prefix"
   fi
 
-  # Dedupe pós-processamento, se solicitado
+  # Dedupe pós-processo
   if [[ -n "$DEDUPE" ]]; then
     case "$DEDUPE" in
       exact) echo "   Removendo duplicados exatos..."; dedupe_exact "$outdir_video" ;;
