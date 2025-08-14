@@ -22,7 +22,11 @@ Opções:
   --unique           Remove quase idênticos na extração (mpdecimate)
   --scene T|A~B      Só mudanças de cena; aceita faixa A~B (tenta de B→A)
   --scene-step S     Passo quando usar faixa em --scene (padrão: 0.01)
-  --dedupe MODE      Pós: "exact" | "phash[:N]" (N padrão 5)
+  --dedupe MODE      Pós:
+                     - exact          (hash criptográfico)
+                     - phash[:N]      (quase-iguais; N padrão 5)
+                     - aggressive     (atalho p/ phash:12)
+                     - diverse[:N]    (mantém só quadros com distância pHash >= N entre si; padrão N=12)
   --webp             Salva em WebP lossless (menor que PNG)
   --flat             NÃO cria subpasta; usa prefixo automático por vídeo
   --prefix P         Prefixo manual (senão é gerado no --flat)
@@ -80,7 +84,7 @@ fi
 mkdir -p "$OUTDIR"
 [[ "$DEBUG" == "1" ]] && set -x
 
-# ---------- Homebrew & ffmpeg/oxipng ----------
+# ---------- Homebrew & deps ----------
 if ! command -v brew >/dev/null 2>&1; then
   echo "Instalando Homebrew..."
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
@@ -114,7 +118,7 @@ make_auto_prefix_for_flat() {
   echo "${try}_"
 }
 
-# venv dedicado para o pHash (foge do PEP 668)
+# venv dedicado p/ pHash (foge do PEP 668)
 PHASH_VENV="${HOME}/.cache/video_to_frames/venv"
 ensure_phash_env() {
   if ! command -v python3 >/dev/null 2>&1; then
@@ -130,7 +134,7 @@ ensure_phash_env() {
   fi
 }
 
-# monta -vf dado um scene_threshold opcional (vazio = sem select)
+# monta -vf com scene opcional
 build_vf_with_scene() {
   local scene_t="${1:-}"
   local vf_parts=()
@@ -149,7 +153,7 @@ count_frames() {
   ls -1 "$dir"/${prefix}*.${ext} 2>/dev/null | wc -l | tr -d ' '
 }
 
-# otimização rápida por padrão (evita travas)
+# otimização rápida por padrão
 optimize_pngs_parallel() {
   local dir="$1" prefix="$2"
   local cores; cores="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
@@ -169,7 +173,7 @@ dedupe_exact() {
   }' "$tmp"
 }
 
-# usa o venv dedicado (Pillow + imagehash)
+# usa venv (Pillow + imagehash)
 dedupe_phash() {
   local dir="$1"; local thresh="${2:-5}"
   ensure_phash_env
@@ -180,7 +184,6 @@ import imagehash
 
 folder = sys.argv[1]
 threshold = int(sys.argv[2]) if len(sys.argv) > 2 else 5
-
 files = sorted(glob.glob(os.path.join(folder, "*.png")) + glob.glob(os.path.join(folder, "*.webp")))
 seen = []
 
@@ -200,14 +203,56 @@ for f in files:
     for (g, hg) in seen:
         if hf - hg <= threshold:
             print(f"removendo quase-duplicado (dist={hf-hg}): {f} ~ {g}")
-            try:
-                os.remove(f)
-            except FileNotFoundError:
-                pass
+            try: os.remove(f)
+            except FileNotFoundError: pass
             dup = True
             break
     if not dup:
         seen.append((f, hf))
+PY
+}
+
+# mantém apenas quadros "extremamente diferentes" (distância mínima entre quaisquer mantidos >= mindist)
+dedupe_diverse() {
+  local dir="$1"; local mindist="${2:-12}"
+  ensure_phash_env
+  "$PHASH_VENV/bin/python" - "$dir" "$mindist" <<'PY'
+import sys, os, glob
+from PIL import Image
+import imagehash
+
+folder = sys.argv[1]
+mind = int(sys.argv[2]) if len(sys.argv) > 2 else 12
+
+files = sorted(glob.glob(os.path.join(folder, "*.png")) + glob.glob(os.path.join(folder, "*.webp")))
+kept = []   # [(file, hash)]
+removed = 0
+
+def h(path):
+    try:
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            return imagehash.phash(im)
+    except Exception:
+        return None
+
+for f in files:
+    hf = h(f)
+    if hf is None: 
+        continue
+    if not kept:
+        kept.append((f,hf))
+        continue
+    # distância mínima até os já mantidos
+    dmin = min(hf - kh for _,kh in kept)
+    if dmin >= mind:
+        kept.append((f,hf))
+    else:
+        print(f"removendo por baixa diversidade (minDist={dmin} < {mind}): {f}")
+        try: os.remove(f); removed += 1
+        except FileNotFoundError: pass
+
+print(f"[diverse] mantidos={len(kept)} removidos={removed} mindist={mind}")
 PY
 }
 
@@ -233,7 +278,7 @@ run_ffmpeg_once() {
   "${cmd[@]}" || true
 }
 
-# thresholds B..A (desc) quando --scene=A~B
+# thresholds B→A quando --scene=A~B
 scene_candidates_desc() {
   local range="$1" step="$2"
   /usr/bin/env python3 - "$range" "$step" <<'PY'
@@ -336,13 +381,27 @@ for INPUT in "${INPUTS[@]}"; do
   # Dedupe pós-processo
   if [[ -n "$DEDUPE" ]]; then
     case "$DEDUPE" in
-      exact) echo "   Removendo duplicados exatos..."; dedupe_exact "$outdir_video" ;;
+      exact)
+        echo "   Removendo duplicados exatos..."
+        dedupe_exact "$outdir_video"
+        ;;
+      aggressive)
+        echo "   Removendo quase-duplicados agressivo (pHash>=12)..."
+        dedupe_phash "$outdir_video" "12"
+        ;;
+      diverse|diverse:*)
+        thr="12"; [[ "$DEDUPE" == diverse:* ]] && thr="${DEDUPE#diverse:}"
+        echo "   Mantendo apenas imagens extremamente diferentes (mindist=${thr})..."
+        dedupe_diverse "$outdir_video" "$thr"
+        ;;
       phash|phash:*)
         thr="5"; [[ "$DEDUPE" == phash:* ]] && thr="${DEDUPE#phash:}"
         echo "   Removendo quase-duplicados (pHash, threshold=${thr})..."
         dedupe_phash "$outdir_video" "$thr"
         ;;
-      *) echo "   Aviso: --dedupe desconhecido: $DEDUPE (ignorando)";;
+      *)
+        echo "   Aviso: --dedupe desconhecido: $DEDUPE (ignorando)"
+        ;;
     esac
   fi
 
