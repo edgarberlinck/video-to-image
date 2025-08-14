@@ -5,14 +5,14 @@ shopt -s nullglob
 usage() {
   cat <<'EOF'
 Uso:
-  video_to_frames.sh --out <DIR> [opções] -- <video1> [video2 ...]
+  video-to-image.sh --out <DIR> [opções] -- <video1> [video2 ...]
 Exemplos:
-  video_to_frames.sh --out ./frames -- -- input.mp4
-  video_to_frames.sh --out ./frames --fps 5 --scale 1280:-1 --unique -- -- a.mp4 b.mov
-  video_to_frames.sh --out ./frames --webp --dedupe phash:6 -- -- input.mp4
-  video_to_frames.sh --out ./frames --flat -- -- a.mp4 b.mp4
-  video_to_frames.sh --out ./frames --scene 0.05~0.10 --scene-step 0.01 -- -- clip.mp4
-  video_to_frames.sh --out ./frames --no-opt --debug -- -- clip.mp4
+  video-to-image.sh --out ./frames -- -- input.mp4
+  video-to-image.sh --out ./frames --fps 5 --scale 1280:-1 --unique -- -- a.mp4 b.mov
+  video-to-image.sh --out ./frames --webp --dedupe phash:6 -- -- input.mp4
+  video-to-image.sh --out ./frames --flat -- -- a.mp4 b.mp4
+  video-to-image.sh --out ./frames --scene 0.05~0.10 --scene-step 0.01 -- -- clip.mp4
+  video-to-image.sh --out ./frames --no-opt --debug -- -- clip.mp4
 
 Opções:
   --fps N            Limita a N fps (após dedupe, se habilitado)
@@ -22,21 +22,17 @@ Opções:
   --unique           Remove quase idênticos na extração (mpdecimate)
   --scene T|A~B      Só mudanças de cena; aceita faixa A~B (tenta de B→A)
   --scene-step S     Passo quando usar faixa em --scene (padrão: 0.01)
-  --dedupe MODE      Pós:
-                     - exact          (hash criptográfico)
-                     - phash[:N]      (quase-iguais; N padrão 5)
-                     - aggressive     (atalho p/ phash:12)
-                     - diverse[:N]    (mantém só quadros com distância pHash >= N entre si; padrão N=12)
-  --webp             Salva em WebP lossless (menor que PNG)
+  --dedupe MODE      Pós: exact | phash[:N] | aggressive | diverse[:N]
+  --webp             Saída WebP lossless (senão PNG)
   --flat             NÃO cria subpasta; usa prefixo automático por vídeo
-  --prefix P         Prefixo manual (senão é gerado no --flat)
+  --prefix P         Prefixo manual (aplicado por vídeo; no flat garante _ no fim)
   --no-opt           Pula otimização de PNGs (mais rápido)
-  --debug            Mostra comandos e logs do ffmpeg
+  --debug            Logs verbosos do ffmpeg
   -h, --help         Ajuda
 
 Notas:
 - Sem --flat: saída em <DIR>/<basename>/frame_000001.ext
-- Em --flat, prefixo automático baseado no nome do vídeo (com -2/-3 se preciso)
+- Em --flat, o prefixo é gerado por **vídeo** (nada sobrescreve)
 - Fallbacks automáticos se nenhum frame for gerado
 EOF
 }
@@ -46,7 +42,7 @@ OUTDIR=""
 FPS=""; SCALE=""; SS=""; DUR=""
 UNIQUE="0"; SCENE=""; SCENE_STEP="0.01"; DEDUPE=""
 USE_WEBP="0"
-FLAT="0"; PREFIX=""
+FLAT="0"; USER_PREFIX=""
 NO_OPT="0"; DEBUG="0"
 
 args_before_inputs=1
@@ -65,7 +61,7 @@ while [[ $# -gt 0 ]]; do
     --dedupe)   DEDUPE="${2:-}"; shift 2;;
     --webp)     USE_WEBP="1"; shift;;
     --flat)     FLAT="1"; shift;;
-    --prefix)   PREFIX="${2:-}"; shift 2;;
+    --prefix)   USER_PREFIX="${2:-}"; shift 2;;
     --no-opt)   NO_OPT="1"; shift;;
     --debug)    DEBUG="1"; shift;;
     -h|--help)  usage; exit 0;;
@@ -118,7 +114,27 @@ make_auto_prefix_for_flat() {
   echo "${try}_"
 }
 
-# venv dedicado p/ pHash (foge do PEP 668)
+# normaliza um prefixo manual (garante sublinhado no final)
+normalize_user_prefix() {
+  local p="$1"
+  [[ -z "$p" ]] && { echo ""; return; }
+  [[ "${p: -1}" == "_" ]] && { echo "$p"; return; }
+  echo "${p}_"
+}
+
+# decide o prefixo *por vídeo*
+resolve_prefix_for_video() {
+  local vname="$1"
+  if [[ -n "$USER_PREFIX" ]]; then
+    normalize_user_prefix "$USER_PREFIX"
+  elif [[ "$FLAT" == "1" ]]; then
+    make_auto_prefix_for_flat "$vname" "$OUTDIR"
+  else
+    echo ""  # em subpasta, pode ser vazio
+  fi
+}
+
+# venv dedicado para o pHash (foge do PEP 668 do Homebrew)
 PHASH_VENV="${HOME}/.cache/video_to_frames/venv"
 ensure_phash_env() {
   if ! command -v python3 >/dev/null 2>&1; then
@@ -134,7 +150,7 @@ ensure_phash_env() {
   fi
 }
 
-# monta -vf com scene opcional
+# monta -vf dado um scene_threshold opcional (vazio = sem select)
 build_vf_with_scene() {
   local scene_t="${1:-}"
   local vf_parts=()
@@ -153,7 +169,7 @@ count_frames() {
   ls -1 "$dir"/${prefix}*.${ext} 2>/dev/null | wc -l | tr -d ' '
 }
 
-# otimização rápida por padrão
+# otimização rápida por padrão (evita travas do zopfli)
 optimize_pngs_parallel() {
   local dir="$1" prefix="$2"
   local cores; cores="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
@@ -173,7 +189,7 @@ dedupe_exact() {
   }' "$tmp"
 }
 
-# usa venv (Pillow + imagehash)
+# pHash via venv
 dedupe_phash() {
   local dir="$1"; local thresh="${2:-5}"
   ensure_phash_env
@@ -184,6 +200,7 @@ import imagehash
 
 folder = sys.argv[1]
 threshold = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+
 files = sorted(glob.glob(os.path.join(folder, "*.png")) + glob.glob(os.path.join(folder, "*.webp")))
 seen = []
 
@@ -203,8 +220,10 @@ for f in files:
     for (g, hg) in seen:
         if hf - hg <= threshold:
             print(f"removendo quase-duplicado (dist={hf-hg}): {f} ~ {g}")
-            try: os.remove(f)
-            except FileNotFoundError: pass
+            try:
+                os.remove(f)
+            except FileNotFoundError:
+                pass
             dup = True
             break
     if not dup:
@@ -212,7 +231,7 @@ for f in files:
 PY
 }
 
-# mantém apenas quadros "extremamente diferentes" (distância mínima entre quaisquer mantidos >= mindist)
+# mantém só quadros extremamente diferentes (distância mínima >= mindist)
 dedupe_diverse() {
   local dir="$1"; local mindist="${2:-12}"
   ensure_phash_env
@@ -225,8 +244,7 @@ folder = sys.argv[1]
 mind = int(sys.argv[2]) if len(sys.argv) > 2 else 12
 
 files = sorted(glob.glob(os.path.join(folder, "*.png")) + glob.glob(os.path.join(folder, "*.webp")))
-kept = []   # [(file, hash)]
-removed = 0
+kept = []; removed = 0
 
 def h(path):
     try:
@@ -238,12 +256,10 @@ def h(path):
 
 for f in files:
     hf = h(f)
-    if hf is None: 
+    if hf is None:
         continue
     if not kept:
-        kept.append((f,hf))
-        continue
-    # distância mínima até os já mantidos
+        kept.append((f,hf)); continue
     dmin = min(hf - kh for _,kh in kept)
     if dmin >= mind:
         kept.append((f,hf))
@@ -306,23 +322,24 @@ for INPUT in "${INPUTS[@]}"; do
   base="$(basename "$INPUT")"
   name="${base%.*}"
 
-  # Decide diretório/prefixo
+  # Decide diretório
   if [[ "$FLAT" == "1" ]]; then
     outdir_video="$OUTDIR"
-    if [[ -z "$PREFIX" ]]; then PREFIX="$(make_auto_prefix_for_flat "$name" "$OUTDIR")"; fi
   else
     outdir_video="$(make_unique_dir "$name" "$OUTDIR")"
     mkdir -p "$outdir_video"
   fi
 
+  # Prefixo *deste vídeo*
+  PREFIX_THIS="$(resolve_prefix_for_video "$name")"
   ext="png"; [[ "$USE_WEBP" == "1" ]] && ext="webp"
-  prefix="${PREFIX}frame_"
+  prefix="${PREFIX_THIS}frame_"
 
   echo ">> Processando: $INPUT"
   echo "   Saída: $outdir_video (formato: $ext)"
+  [[ "$FLAT" == "1" ]] && echo "   Prefixo: ${PREFIX_THIS:-<vazio>}"
   [[ -n "$SS"  ]] && echo "   -ss $SS"
   [[ -n "$DUR" ]] && echo "   -t  $DUR"
-  [[ "$FLAT" == "1" ]] && echo "   Prefixo: ${PREFIX}"
 
   frames_count=0
 
@@ -344,7 +361,7 @@ for INPUT in "${INPUTS[@]}"; do
     frames_count=$(count_frames "$outdir_video" "$prefix" "$ext")
   fi
 
-  # 2) Fallback sem dedupe/scene
+  # 2) Fallback sem dedupe/scene (mantém fps/scale)
   if (( frames_count == 0 )); then
     echo "   [fallback] 0 frames; tentando sem dedupe/scene..."
     vf_no_ded=""
